@@ -34,7 +34,7 @@
 #include "deca_param_types.h"
 #include "deca_regs.h"
 #include "deca_device_api.h"
-#include "uart.h"
+#include "UART.h"
 	
 //-----------------dw1000----------------------------
 
@@ -58,8 +58,14 @@ static dwt_config_t config = {
 #define POLL_TX_TO_RESP_RX_DLY_UUS 100 
 
 /*Should be accurately calculated during calibration*/
+#ifndef TX_ANT_DLY
 #define TX_ANT_DLY 16300
-#define RX_ANT_DLY 16456	
+#endif
+#ifndef RX_ANT_DLY
+#define RX_ANT_DLY 16456
+#endif
+// #define TX_ANT_DLY 16300
+// #define RX_ANT_DLY 16456	
 
 //--------------dw1000---end---------------
 
@@ -133,7 +139,7 @@ int main(void)
   
   /*Initialization UART*/
   boUART_Init ();
-  printf("Singled Sided Two Way Ranging Initiator Example \r\n");
+  uart_printf("Singled Sided Two Way Ranging Initiator Example \r\n");
   
   /* Reset DW1000 */
   reset_DW1000(); 
@@ -165,6 +171,12 @@ int main(void)
   * As this example only handles one incoming frame with always the same delay and timeout, those values can be set here once for all. */
   dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
   dwt_setrxtimeout(65000); // Maximum value timeout with DW1000 is 65ms  
+  uart_printf("Node ID : %08lX%08lX\r\n",
+            (unsigned long)NRF_FICR->DEVICEID[1],
+            (unsigned long)NRF_FICR->DEVICEID[0]);
+  uart_printf("BLE addr : %04lX%08lX\r\n",
+            (unsigned long)(NRF_FICR->DEVICEADDR[1] & 0xFFFF),
+            (unsigned long)NRF_FICR->DEVICEADDR[0]);
 
   //-------------dw1000  ini------end---------------------------	
   // IF WE GET HERE THEN THE LEDS WILL BLINK
@@ -200,7 +212,7 @@ int main(void)
  *    device should have its own antenna delay properly calibrated to get good precision when performing range measurements.
  * 3. This timeout is for complete reception of a frame, i.e. timeout duration must take into account the length of the expected frame. Here the value
  *    is arbitrary but chosen large enough to make sure that there is enough time to receive the complete response frame sent by the responder at the
- *    6.8M data rate used (around 200 µs).
+ *    6.8M data rate used (around 200 ï¿½s).
  * 4. In a real application, for optimum performance within regulatory limits, it may be necessary to set TX pulse bandwidth and TX power, (using
  *    the dwt_configuretxrf API call) to per device calibrated values saved in the target system or the DW1000 OTP memory.
  * 5. The user is referred to DecaRanging ARM application (distributed with EVK1000 product) for additional practical example of usage, and to the

@@ -26,6 +26,7 @@
 #include "deca_device_api.h"
 #include "deca_regs.h"
 #include "port_platform.h"
+#include "UART.h"
 
 #define APP_NAME "SS TWR INIT v1.3"
 
@@ -54,7 +55,7 @@ static uint8 rx_buffer[RX_BUF_LEN];
 static uint32 status_reg = 0;
 
 /* UWB microsecond (uus) to device time unit (dtu, around 15.65 ps) conversion factor.
-* 1 uus = 512 / 499.2 µs and 1 µs = 499.2 * 128 dtu. */
+* 1 uus = 512 / 499.2 ï¿½s and 1 ï¿½s = 499.2 * 128 dtu. */
 #define UUS_TO_DWT_TIME 65536
 
 /* Speed of light in air, in metres per second. */
@@ -99,7 +100,7 @@ int ss_init_run(void)
   * set by dwt_setrxaftertxdelay() has elapsed. */
   dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
   tx_count++;
-  printf("Transmission # : %d\r\n",tx_count);
+  uart_printf("Transmission # : %d\r\n",tx_count);
 
 
   /* We assume that the transmission is achieved correctly, poll for reception of a frame or error/timeout. See NOTE 4 below. */
@@ -140,7 +141,7 @@ int ss_init_run(void)
     if (memcmp(rx_buffer, rx_resp_msg, ALL_MSG_COMMON_LEN) == 0)
     {	
       rx_count++;
-      printf("Reception # : %d\r\n",rx_count);
+      uart_printf("Reception # : %d\r\n",rx_count);
       uint32 poll_tx_ts, resp_rx_ts, poll_rx_ts, resp_tx_ts;
       int32 rtd_init, rtd_resp;
       float clockOffsetRatio ;
@@ -162,7 +163,7 @@ int ss_init_run(void)
 
       tof = ((rtd_init - rtd_resp * (1.0f - clockOffsetRatio)) / 2.0f) * DWT_TIME_UNITS; // Specifying 1.0f and 2.0f are floats to clear warning 
       distance = tof * SPEED_OF_LIGHT;
-      printf("Distance : %f\r\n",distance);
+      uart_printf("Distance : %f\r\n",distance);
     }
   }
   else

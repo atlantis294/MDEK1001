@@ -19,6 +19,7 @@
 #include "UART.h"
 #include "bsp.h"
 #include "boards.h"
+#include <stdarg.h>
 
 #define NO_PARITY	false
 
@@ -89,3 +90,25 @@ static void vHandleUartInternalErrors (uint32_t u32Error)
 	// notify app of error - LED ?
 }
 
+
+/**
+ * @brief printf vers l'UART, sans dépendre de stdout / de la RTL.
+ */
+void uart_printf(const char *fmt, ...)
+{
+    char buf[128];
+    va_list ap;
+
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    if (n < 0) return;
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+
+    for (int i = 0; i < n; i++)
+    {
+        /* Attend de la place dans le FIFO TX (vidé par l'interruption UART) */
+        while (app_uart_put((uint8_t)buf[i]) != NRF_SUCCESS) { }
+    }
+}
