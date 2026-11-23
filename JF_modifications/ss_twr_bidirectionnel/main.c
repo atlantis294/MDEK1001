@@ -35,6 +35,7 @@
 #include "deca_regs.h"
 #include "deca_device_api.h"
 #include "UART.h"
+#include "nrf_drv_gpiote.h"
 	
 //-----------------dw1000----------------------------
 
@@ -81,6 +82,11 @@ TaskHandle_t  led_toggle_task_handle;   /**< Reference to LED0 toggling FreeRTOS
 TimerHandle_t led_toggle_timer_handle;  /**< Reference to LED1 toggling FreeRTOS timer. */
 #endif
 
+void vInterruptHandler(nrf_drv_gpiote_pin_t pin, nrf_gpiote_polarity_t action);
+void vInterruptInit(void);
+BaseType_t init_task_ok = pdFAIL;
+
+
 #ifdef USE_FREERTOS
 
 /**@brief LED0 task entry function.
@@ -110,7 +116,7 @@ static void led_toggle_timer_callback (void * pvParameter)
 }
 #else
 
-  extern int ss_init_run(void);
+  extern int ss_init_run(uint16_t target_id);
 
 #endif   // #ifdef USE_FREERTOS
 
@@ -129,7 +135,7 @@ int main(void)
     UNUSED_VARIABLE(xTimerStart(led_toggle_timer_handle, 0));
 
     /* Create task for SS TWR Initiator set to 2 */
-    UNUSED_VARIABLE(xTaskCreate(ss_initiator_task_function, "SSTWR_INIT", configMINIMAL_STACK_SIZE + 200, NULL, 2, &ss_initiator_task_handle));
+    init_task_ok = xTaskCreate(ss_initiator_task_function, "SSTWR_INIT", configMINIMAL_STACK_SIZE + 200, NULL, 2, &ss_initiator_task_handle);
   #endif // #ifdef USE_FREERTOS
   
   //-------------dw1000  ini------------------------------------	
@@ -139,7 +145,8 @@ int main(void)
   
   /*Initialization UART*/
   boUART_Init ();
-  uart_printf("Singled Sided Two Way Ranging Initiator Example \r\n");
+  uart_printf("JF Bidirectionnel \r\n");
+  if (init_task_ok != pdPASS) uart_printf("ERREUR : tache non creee\r\n");  
   
   /* Reset DW1000 */
   reset_DW1000(); 
@@ -170,7 +177,9 @@ int main(void)
   /* Set expected response's delay and timeout. 
   * As this example only handles one incoming frame with always the same delay and timeout, those values can be set here once for all. */
   dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
-  dwt_setrxtimeout(65000); // Maximum value timeout with DW1000 is 65ms  
+  dwt_setrxtimeout(0); // Maximum value timeout with DW1000 is 65ms  
+
+  vInterruptInit();
 
   // Affichage des nom des puces
   // uart_printf("Node ID : %08lX%08lX\r\n",
@@ -199,6 +208,27 @@ int main(void)
     }
 
   #endif
+}
+
+void vInterruptHandler(nrf_drv_gpiote_pin_t pin, nrf_gpiote_polarity_t action)
+{
+  dwt_isr();   /* lit SYS_STATUS, appelle les callbacks, acquitte les événements */
+}
+
+void vInterruptInit (void)
+{
+  ret_code_t err_code;
+
+  if (!nrf_drv_gpiote_is_init())
+    nrf_drv_gpiote_init();
+
+  /* front montant : polarité par défaut de l'IRQ du DW1000 = actif haut (manuel §2.2.2) */
+  nrf_drv_gpiote_in_config_t in_config = GPIOTE_CONFIG_IN_SENSE_LOTOHI(true);
+  in_config.pull = NRF_GPIO_PIN_NOPULL;
+
+  err_code = nrf_drv_gpiote_in_init(DW1000_IRQ, &in_config, vInterruptHandler);
+  APP_ERROR_CHECK(err_code);
+  nrf_drv_gpiote_in_event_enable(DW1000_IRQ, true);
 }
 
 /*****************************************************************************************************************************************************

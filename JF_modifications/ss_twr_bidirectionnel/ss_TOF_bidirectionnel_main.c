@@ -1,311 +1,134 @@
 /*! ----------------------------------------------------------------------------
-*  @file    ss_init_main.c
-*  @brief   Single-sided two-way ranging (SS TWR) initiator example code
+*  @file    ss_TOF_bidirectionnel_main.c
+*  @brief   SS-TWR bidirectionnel : chaque carte est a la fois initiateur et repondeur.
 *
-*           This is a simple code example which acts as the initiator in a SS TWR distance measurement exchange. This application sends a "poll"
-*           frame (recording the TX time-stamp of the poll), after which it waits for a "response" message from the "DS TWR responder" example
-*           code (companion to this application) to complete the exchange. The response message contains the remote responder's time-stamps of poll
-*           RX, and response TX. With this data and the local time-stamps, (of poll TX and response RX), this example application works out a value
-*           for the time-of-flight over-the-air and, thus, the estimated distance between the two devices, which it writes to the LCD.
+*           - Toutes les POLL_PERIOD_MS (1 minute) la carte tente de contacter les autres :
+*             un poll en diffusion (decouverte) puis un poll direct vers chaque carte connue.
+*           - Le reste du temps le recepteur du DW1000 reste allume. Des qu'une trame arrive,
+*             l'IRQ du DW1000 declenche dwt_isr() -> rx_ok_cb() qui lit la trame, repond au
+*             poll (emission differee) ou enregistre la reponse recue. Les messages UART sont
+*             ensuite affiches par la tache (jamais dans l'interruption).
 *
+*           Chaine : DW1000 IRQ -> GPIOTE (main.c, vInterruptHandler) -> dwt_isr() -> callbacks.
 *
-*           Notes at the end of this file, expand on the inline comments.
-* 
-* @attention
-*
-* Copyright 2015 (c) Decawave Ltd, Dublin, Ireland.
-*
-* All rights reserved.
-*
-* @author Decawave
+*           Base sur ss_init_main.c / ss_resp_main.c, Copyright Decawave Ltd, Dublin, Ireland.
 */
 #include <stdio.h>
 #include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
+#include "nordic_common.h"
+#include "boards.h"
+#include "nrf.h"
+#include "nrf_gpio.h"
 #include "deca_device_api.h"
 #include "deca_regs.h"
 #include "port_platform.h"
 #include "UART.h"
-#include "nrf.h"
-#include <string.h>
 
-#define APP_NAME "SS TWR INIT v1.3"
+/* ------------------------------------------------------------------------------------------- */
+/* Gardes : valeurs par defaut si le projet ne les definit pas deja                            */
+/* ------------------------------------------------------------------------------------------- */
+#ifndef DW1000_IRQ
+#define DW1000_IRQ 19
+#endif
+#ifndef TX_ANT_DLY
+#define TX_ANT_DLY 16300
+#endif
+#ifndef DWT_INT_SFDT
+#define DWT_INT_SFDT 0x04000000      /* RXSFDTO : bit 26 de SYS_MASK */
+#endif
 
-/* Inter-ranging delay period, in milliseconds. */
-#define RNG_DELAY_MS 100
+/* ------------------------------------------------------------------------------------------- */
+/* Parametres                                                                                  */
+/* ------------------------------------------------------------------------------------------- */
+#define POLL_KNOWN_PERIOD_MS   1000     /* poll des cartes connues : toutes les secondes */
+#define DISCOVER_PERIOD_MS    10000     /* recherche de nouvelles cartes : toutes les 10 s */
+#define RESP_WAIT_MS             10     /* attente de la reponse (la reponse arrive en ~1,5 ms) */
 
-/* My id utilise l'id de la puce NRF */
-#define TARGET_ALL 0xFFFF            /* adresse de diffusion */
-static uint16_t my_id;               /* rempli au démarrage, voir 2. */
-static uint16_t target_id = TARGET_ALL;   /* destinataire du poll */
-#define FUNC_POLL 0xE0
-#define FUNC_RESP 0xE1
-static const uint8 rx_hdr[5] = {0x41, 0x88, 0, 0xCA, 0xDE};   /* FC, SN (=0), PAN ID */
+#define TARGET_ALL       0xFFFF      /* adresse de diffusion */
+#define FUNC_POLL        0xE0
+#define FUNC_RESP        0xE1
 
-/* Délai entre réception du poll et émission de la réponse (valeur de l'exemple Decawave) */
+/* Delai poll recu -> reponse emise (valeur de ss_resp_main.c pour le nRF) */
 #define POLL_RX_TO_RESP_TX_DLY_UUS 1100
 
-static uint8 tx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, FUNC_RESP, 0,0,0,0, 0,0,0,0, 0, 0};
-static uint8 tx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, FUNC_POLL, 0, 0};
+#define UUS_TO_DWT_TIME  65536
+#define SPEED_OF_LIGHT   299702547
 
-/* Frames used in the ranging process. See NOTE 1,2 below. */
-// static uint8 tx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0, 0, 0};
-// static uint8 rx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-/* Length of the common part of the message (up to and including the function code, see NOTE 1 below). */
-#define ALL_MSG_COMMON_LEN 10
-/* Indexes to access some of the fields in the frames defined above. */
-#define ALL_MSG_SN_IDX 2
+/* ------------------------------------------------------------------------------------------- */
+/* Trames                                                                                      */
+/* ------------------------------------------------------------------------------------------- */
+static const uint8 rx_hdr[5] = {0x41, 0x88, 0, 0xCA, 0xDE};   /* FC, SN (=0), PAN ID */
+
+static uint8 tx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, FUNC_POLL, 0, 0};
+static uint8 tx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, FUNC_RESP, 0,0,0,0, 0,0,0,0, 0, 0};
+
+#define ALL_MSG_SN_IDX          2
 #define RESP_MSG_POLL_RX_TS_IDX 10
 #define RESP_MSG_RESP_TX_TS_IDX 14
-#define RESP_MSG_TS_LEN 4
-/* Frame sequence number, incremented after each transmission. */
-static uint8 frame_seq_nb = 0;
+#define RESP_MSG_TS_LEN         4
 
-/* Buffer to store received response message.
-* Its size is adjusted to longest frame that this example code is supposed to handle. */
-#define RX_BUF_LEN 20
+#define RX_BUF_LEN 20                /* la plus longue trame (reponse) : 20 octets avec le CRC */
 static uint8 rx_buffer[RX_BUF_LEN];
 
-/* Hold copy of status register state here for reference so that it can be examined at a debug breakpoint. */
-static uint32 status_reg = 0;
+/* ------------------------------------------------------------------------------------------- */
+/* Etat partage entre l'interruption et la tache                                               */
+/* ------------------------------------------------------------------------------------------- */
+static uint16_t my_id;                          /* 16 bits bas de NRF_FICR->DEVICEID[0] */
+static uint8    frame_seq_nb = 0;
+static volatile int tx_count = 0;
+static volatile int rx_count = 0;
 
-/* UWB microsecond (uus) to device time unit (dtu, around 15.65 ps) conversion factor.
-* 1 uus = 512 / 499.2 �s and 1 �s = 499.2 * 128 dtu. */
-#define UUS_TO_DWT_TIME 65536
+static volatile uint8    last_tx_func     = 0;  /* FUNC_POLL ou FUNC_RESP : dernier type emis */
+static volatile uint32   poll_tx_ts_saved = 0;  /* horodatage d'emission de MON dernier poll */
+static volatile bool     awaiting_resp    = false;
+static volatile uint16_t poll_dest        = TARGET_ALL;
 
-/* Speed of light in air, in metres per second. */
-#define SPEED_OF_LIGHT 299702547
-
-/* Hold copies of computed time of flight and distance here for reference so that it can be examined at a debug breakpoint. */
 static double tof;
 static double distance;
 
-/* Declaration of static functions. */
-static void resp_msg_get_ts(uint8 *ts_field, uint32 *ts);
+/* File d'evenements : l'interruption ecrit, la tache lit (un seul producteur, un seul consommateur) */
+#define EVT_POLL_RX 1
+#define EVT_RESP_RX 2
 
-/* Declaration of static functions. */
-//static uint64 get_tx_timestamp_u64(void);
-static uint64 get_rx_timestamp_u64(void);
-static void resp_msg_set_ts(uint8 *ts_field, const uint64 ts);
+typedef struct {
+  uint8    type;
+  uint16_t src;
+  uint16_t dest;
+  bool     resp_sent;                           /* EVT_POLL_RX : la reponse a-t-elle pu partir ? */
+  uint32   poll_tx_ts, resp_rx_ts;              /* EVT_RESP_RX : horodatages locaux */
+  uint32   poll_rx_ts, resp_tx_ts;              /* EVT_RESP_RX : horodatages du repondeur */
+  int32    carrier;
+} evt_t;
 
+#define EVT_N 16
+static evt_t evt_q[EVT_N];
+static volatile uint8 evt_w = 0;
+static volatile uint8 evt_r = 0;
 
-/*Transactions Counters */
-static volatile int tx_count = 0 ; // Successful transmit counter
-static volatile int rx_count = 0 ; // Successful receive counter 
-
-
-/*! ------------------------------------------------------------------------------------------------------------------
-* @fn main()
-*
-* @brief Application entry point.
-*
-* @param  none
-*
-* @return none
-*/
-int ss_init_run(void)
+static evt_t *evt_slot(void)
 {
-
-
-  /* Loop forever initiating ranging exchanges. */
-
-
-  /* Write frame data to DW1000 and prepare transmission. See NOTE 3 below. */
-  tx_poll_msg[5] = target_id & 0xFF;  tx_poll_msg[6] = target_id >> 8;   /* destination */
-  tx_poll_msg[7] = my_id & 0xFF;      tx_poll_msg[8] = my_id >> 8;        /* source */
-  tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
-  dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
-  dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0); /* Zero offset in TX buffer. */
-  dwt_writetxfctrl(sizeof(tx_poll_msg), 0, 1); /* Zero offset in TX buffer, ranging. */
-
-  /* Start transmission, indicating that a response is expected so that reception is enabled automatically after the frame is sent and the delay
-  * set by dwt_setrxaftertxdelay() has elapsed. */
-  dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
-  tx_count++;
-  // uart_printf("Transmission to %d \r\n",target_id);
-  uart_printf("Transmission from %04X to %04X \r\n",(unsigned)my_id, (unsigned)target_id);
-
-
-  /* We assume that the transmission is achieved correctly, poll for reception of a frame or error/timeout. See NOTE 4 below. */
-  while (!((status_reg = dwt_read32bitreg(SYS_STATUS_ID)) & (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR)))
-  {};
-
-    #if 0  // include if required to help debug timeouts.
-    int temp = 0;		
-    if(status_reg & SYS_STATUS_RXFCG )
-    temp =1;
-    else if(status_reg & SYS_STATUS_ALL_RX_TO )
-    temp =2;
-    if(status_reg & SYS_STATUS_ALL_RX_ERR )
-    temp =3;
-    #endif
-
-  /* Increment frame sequence number after transmission of the poll message (modulo 256). */
-  frame_seq_nb++;
-
-  if (status_reg & SYS_STATUS_RXFCG)
-  {		
-    uint32 frame_len;
-
-    /* Clear good RX frame event in the DW1000 status register. */
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_RXFCG);
-
-    /* A frame has been received, read it into the local buffer. */
-    frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
-   
-    if (frame_len <= RX_BUF_LEN)
-    {
-      dwt_readrxdata(rx_buffer, frame_len, 0);
-    }
-
-    /* Check that the frame is the expected response from the companion "SS TWR responder" example.
-    * As the sequence number field of the frame is not relevant, it is cleared to simplify the validation of the frame. */
-    rx_buffer[ALL_MSG_SN_IDX] = 0;
-
-    uint16_t rx_dest = rx_buffer[5] | (rx_buffer[6] << 8);
-    uint16_t rx_src  = rx_buffer[7] | (rx_buffer[8] << 8);
-    uint8    rx_func = rx_buffer[9];
-    bool header_ok = (frame_len <= RX_BUF_LEN) && (memcmp(rx_buffer, rx_hdr, 5) == 0);
-    if (header_ok && rx_func == FUNC_RESP && rx_dest == my_id)
-    {
-      if (target_id == 0xFFFF)
-      {
-        target_id = rx_src;
-        uart_printf("New target_id: %04X\r\n", (unsigned)target_id);
-      }
-      rx_count++;
-      uart_printf("Reception from %04X \r\n",(unsigned)rx_src);
-      uint32 poll_tx_ts, resp_rx_ts, poll_rx_ts, resp_tx_ts;
-      int32 rtd_init, rtd_resp;
-      float clockOffsetRatio ;
-
-      /* Retrieve poll transmission and response reception timestamps. See NOTE 5 below. */
-      poll_tx_ts = dwt_readtxtimestamplo32();
-      resp_rx_ts = dwt_readrxtimestamplo32();
-
-      /* Read carrier integrator value and calculate clock offset ratio. See NOTE 7 below. */
-      clockOffsetRatio = dwt_readcarrierintegrator() * (FREQ_OFFSET_MULTIPLIER * HERTZ_TO_PPM_MULTIPLIER_CHAN_5 / 1.0e6) ;
-
-      /* Get timestamps embedded in response message. */
-      resp_msg_get_ts(&rx_buffer[RESP_MSG_POLL_RX_TS_IDX], &poll_rx_ts);
-      resp_msg_get_ts(&rx_buffer[RESP_MSG_RESP_TX_TS_IDX], &resp_tx_ts);
-
-      /* Compute time of flight and distance, using clock offset ratio to correct for differing local and remote clock rates */
-      rtd_init = resp_rx_ts - poll_tx_ts;
-      rtd_resp = resp_tx_ts - poll_rx_ts;
-
-      tof = ((rtd_init - rtd_resp * (1.0f - clockOffsetRatio)) / 2.0f) * DWT_TIME_UNITS; // Specifying 1.0f and 2.0f are floats to clear warning 
-      distance = tof * SPEED_OF_LIGHT;
-      uart_printf("Distance %04X : %f\r\n", (unsigned)rx_src, distance); 
-      }
-
-      // Si ca target all ou que cela me target, je réponds
-      if (header_ok && rx_func == FUNC_POLL && (rx_dest == TARGET_ALL || rx_dest == my_id) && rx_src != my_id)
-      {
-          uint32 resp_tx_time;
-          uint64 poll_rx_ts, resp_tx_ts;
-          uart_printf("Reception from %04X \r\n",(unsigned)rx_src);
-
-          poll_rx_ts = get_rx_timestamp_u64();
-
-          resp_tx_time = (poll_rx_ts + (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8;
-          dwt_setdelayedtrxtime(resp_tx_time);
-          resp_tx_ts = (((uint64)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
-
-          tx_resp_msg[5] = rx_src & 0xFF;   tx_resp_msg[6] = rx_src >> 8;     /* destination = émetteur du poll */
-          tx_resp_msg[7] = my_id & 0xFF;    tx_resp_msg[8] = my_id >> 8;      /* source = moi */
-          resp_msg_set_ts(&tx_resp_msg[RESP_MSG_POLL_RX_TS_IDX], poll_rx_ts);
-          resp_msg_set_ts(&tx_resp_msg[RESP_MSG_RESP_TX_TS_IDX], resp_tx_ts);
-          tx_resp_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
-
-          dwt_writetxdata(sizeof(tx_resp_msg), tx_resp_msg, 0);
-          dwt_writetxfctrl(sizeof(tx_resp_msg), 0, 1);
-
-          if (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS)
-          {
-              while (!(dwt_read32bitreg(SYS_STATUS_ID) & SYS_STATUS_TXFRS)) { }
-              dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_TXFRS);
-              frame_seq_nb++;
-          }
-
-          if (rx_dest == TARGET_ALL)
-          {
-            target_id = rx_src;
-            uart_printf("Target all - New target_id: %04X\r\n", (unsigned)target_id);
-          }
-      }
-  }
-  else
-  {
-    /* Clear RX error/timeout events in the DW1000 status register. */
-    dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-
-    /* Reset RX to properly reinitialise LDE operation. */
-    dwt_rxreset();
-  }
-
-  /* Execute a delay between ranging exchanges. */
-  //     deca_sleep(RNG_DELAY_MS);
-
-  //	return(1);
+  uint8 nxt = (uint8)((evt_w + 1) % EVT_N);
+  if (nxt == evt_r) return NULL;                /* file pleine : evenement perdu */
+  return &evt_q[evt_w];
 }
 
-/*! ------------------------------------------------------------------------------------------------------------------
-* @fn resp_msg_get_ts()
-*
-* @brief Read a given timestamp value from the response message. In the timestamp fields of the response message, the
-*        least significant byte is at the lower address.
-*
-* @param  ts_field  pointer on the first byte of the timestamp field to get
-*         ts  timestamp value
-*
-* @return none
-*/
-static void resp_msg_get_ts(uint8 *ts_field, uint32 *ts)
+static void evt_commit(void)
 {
-  int i;
-  *ts = 0;
-  for (i = 0; i < RESP_MSG_TS_LEN; i++)
-  {
-    *ts += ts_field[i] << (i * 8);
-  }
+  __DMB();                                      /* donnees ecrites avant l'index */
+  evt_w = (uint8)((evt_w + 1) % EVT_N);
 }
 
+/* Liste des cartes connues (cote tache uniquement) */
+#define MAX_TAGS 50
+static uint16_t tag_ids[MAX_TAGS];
+static float    tag_distances[MAX_TAGS];
+static uint8_t  tag_count = 0;
 
-/**@brief SS TWR Initiator task entry function.
-*
-* @param[in] pvParameter   Pointer that will be used as the parameter for the task.
-*/
-void ss_initiator_task_function (void * pvParameter)
-{
-  UNUSED_PARAMETER(pvParameter);
-
-  my_id = (uint16_t)(NRF_FICR->DEVICEID[0] & 0xFFFF);
-
-  //dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
-
-  dwt_setleds(DWT_LEDS_ENABLE);
-
-  while (true)
-  {
-    ss_init_run();
-    /* Delay a task for a given number of ticks */
-    vTaskDelay(RNG_DELAY_MS);
-    /* Tasks must be implemented to never return... */
-  }
-}
-
-/*! ------------------------------------------------------------------------------------------------------------------
-* @fn get_rx_timestamp_u64()
-*
-* @brief Get the RX time-stamp in a 64-bit variable.
-*        /!\ This function assumes that length of time-stamps is 40 bits, for both TX and RX!
-*
-* @param  none
-*
-* @return  64-bit value of the read time-stamp.
-*/
+/* ------------------------------------------------------------------------------------------- */
+/* Utilitaires horodatages                                                                     */
+/* ------------------------------------------------------------------------------------------- */
 static uint64 get_rx_timestamp_u64(void)
 {
   uint8 ts_tab[5];
@@ -320,18 +143,6 @@ static uint64 get_rx_timestamp_u64(void)
   return ts;
 }
 
-
-/*! ------------------------------------------------------------------------------------------------------------------
-* @fn final_msg_set_ts()
-*
-* @brief Fill a given timestamp field in the response message with the given value. In the timestamp fields of the
-*        response message, the least significant byte is at the lower address.
-*
-* @param  ts_field  pointer on the first byte of the timestamp field to fill
-*         ts  timestamp value
-*
-* @return none
-*/
 static void resp_msg_set_ts(uint8 *ts_field, const uint64 ts)
 {
   int i;
@@ -341,45 +152,389 @@ static void resp_msg_set_ts(uint8 *ts_field, const uint64 ts)
   }
 }
 
+static void resp_msg_get_ts(const uint8 *ts_field, uint32 *ts)
+{
+  int i;
+  *ts = 0;
+  for (i = 0; i < RESP_MSG_TS_LEN; i++)
+  {
+    *ts += (uint32)ts_field[i] << (i * 8);
+  }
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* Cote interruption (callbacks appeles par dwt_isr) : pas de uart_printf, pas d'attente       */
+/* ------------------------------------------------------------------------------------------- */
+static void rx_restart(void)
+{
+  dwt_rxenable(DWT_START_RX_IMMEDIATE);
+}
+
+/* Reponse a un poll : emission differee de POLL_RX_TO_RESP_TX_DLY_UUS apres la reception */
+static bool send_RESP(uint16_t dest)
+{
+  uint32 resp_tx_time;
+  uint64 poll_rx_ts, resp_tx_ts;
+
+  poll_rx_ts = get_rx_timestamp_u64();
+
+  resp_tx_time = (poll_rx_ts + (POLL_RX_TO_RESP_TX_DLY_UUS * UUS_TO_DWT_TIME)) >> 8;
+  dwt_setdelayedtrxtime(resp_tx_time);
+  resp_tx_ts = (((uint64)(resp_tx_time & 0xFFFFFFFEUL)) << 8) + TX_ANT_DLY;
+
+  tx_resp_msg[5] = dest & 0xFF;     tx_resp_msg[6] = dest >> 8;       /* destination = emetteur du poll */
+  tx_resp_msg[7] = my_id & 0xFF;    tx_resp_msg[8] = my_id >> 8;      /* source = moi */
+  resp_msg_set_ts(&tx_resp_msg[RESP_MSG_POLL_RX_TS_IDX], poll_rx_ts);
+  resp_msg_set_ts(&tx_resp_msg[RESP_MSG_RESP_TX_TS_IDX], resp_tx_ts);
+  tx_resp_msg[ALL_MSG_SN_IDX] = frame_seq_nb++;
+
+  last_tx_func = FUNC_RESP;
+  dwt_writetxdata(sizeof(tx_resp_msg), tx_resp_msg, 0);
+  dwt_writetxfctrl(sizeof(tx_resp_msg), 0, 1);
+
+  return (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS);
+}
+
+/* Fin d'emission (poll ou reponse) */
+static void tx_ok_cb(const dwt_cb_data_t *cb_data)
+{
+  (void)cb_data;
+  if (last_tx_func == FUNC_POLL)
+  {
+    /* Horodatage d'emission de mon poll, sauvegarde ici car une reponse a un autre poll
+       ecraserait le registre. Le recepteur est deja arme par DWT_RESPONSE_EXPECTED. */
+    poll_tx_ts_saved = dwt_readtxtimestamplo32();
+  }
+  else
+  {
+    rx_restart();                               /* reponse partie : retour a l'ecoute */
+  }
+}
+
+/* Trame recue avec CRC correct */
+static void rx_ok_cb(const dwt_cb_data_t *cb_data)
+{
+  bool tx_started = false;
+  uint32 len = cb_data->datalength;
+
+  if (len <= RX_BUF_LEN)
+  {
+    dwt_readrxdata(rx_buffer, len, 0);
+    rx_buffer[ALL_MSG_SN_IDX] = 0;              /* numero de sequence ignore pour la comparaison */
+
+    if (memcmp(rx_buffer, rx_hdr, 5) == 0)
+    {
+      uint16_t rx_dest = rx_buffer[5] | (rx_buffer[6] << 8);
+      uint16_t rx_src  = rx_buffer[7] | (rx_buffer[8] << 8);
+      uint8    rx_func = rx_buffer[9];
+
+      /* Poll recu, en diffusion ou pour moi : je reponds tout de suite */
+      if (rx_func == FUNC_POLL && (rx_dest == TARGET_ALL || rx_dest == my_id) && rx_src != my_id)
+      {
+        tx_started = send_RESP(rx_src);
+
+        evt_t *e = evt_slot();
+        if (e)
+        {
+          e->type      = EVT_POLL_RX;
+          e->src       = rx_src;
+          e->dest      = rx_dest;
+          e->resp_sent = tx_started;
+          evt_commit();
+        }
+      }
+      /* Reponse a mon poll : on garde les horodatages, la tache calcule la distance */
+      else if (rx_func == FUNC_RESP && rx_dest == my_id && awaiting_resp &&
+               (poll_dest == TARGET_ALL || poll_dest == rx_src))
+      {
+        evt_t *e = evt_slot();
+        if (e)
+        {
+          e->type       = EVT_RESP_RX;
+          e->src        = rx_src;
+          e->dest       = rx_dest;
+          e->poll_tx_ts = poll_tx_ts_saved;
+          e->resp_rx_ts = dwt_readrxtimestamplo32();
+          e->carrier    = dwt_readcarrierintegrator();
+          resp_msg_get_ts(&rx_buffer[RESP_MSG_POLL_RX_TS_IDX], &e->poll_rx_ts);
+          resp_msg_get_ts(&rx_buffer[RESP_MSG_RESP_TX_TS_IDX], &e->resp_tx_ts);
+          evt_commit();
+          awaiting_resp = false;
+        }
+      }
+    }
+  }
+
+  if (!tx_started)
+  {
+    rx_restart();     /* sinon tx_ok_cb relancera l'ecoute apres l'emission de la reponse */
+  }
+}
+
+/* Timeout : ne devrait pas arriver (timeout de trame a 0), on reste a l'ecoute */
+static void rx_to_cb(const dwt_cb_data_t *cb_data)
+{
+  (void)cb_data;
+  rx_restart();
+}
+
+/* Erreur de reception (PHR, CRC, Reed-Solomon, timeout SFD...) : reset du recepteur et reecoute */
+static void rx_err_cb(const dwt_cb_data_t *cb_data)
+{
+  (void)cb_data;
+  dwt_rxreset();
+  rx_restart();
+}
+
+/* ------------------------------------------------------------------------------------------- */
+/* Cote tache                                                                                  */
+/* ------------------------------------------------------------------------------------------- */
+/* decamutexon()/decamutexoff() du port Decawave ne font rien ("currently do nothing").
+   On masque donc nous-memes l'interruption GPIOTE (celle de la broche IRQ du DW1000) pendant
+   les acces SPI de la tache : un front montant arrive pendant ce temps reste en attente dans le
+   NVIC et l'interruption est executee des qu'on la reactive. */
+static uint32_t dw_irq_off(void)
+{
+  uint32_t was_enabled = NVIC->ISER[GPIOTE_IRQn >> 5] & (1UL << (GPIOTE_IRQn & 0x1F));
+  NVIC_DisableIRQ(GPIOTE_IRQn);
+  __DSB();
+  __ISB();
+  return was_enabled;
+}
+
+static void dw_irq_on(uint32_t was_enabled)
+{
+  if (was_enabled) NVIC_EnableIRQ(GPIOTE_IRQn);
+}
+
+static int tag_index(uint16_t id)
+{
+  for (int i = 0; i < tag_count; i++)
+  {
+    if (tag_ids[i] == id) return i;
+  }
+  return -1;
+}
+
+static void add_tag_in_my_list(uint16_t id)
+{
+  if (id == my_id || id == TARGET_ALL) return;
+  if (tag_index(id) >= 0) return;
+
+  if (tag_count < MAX_TAGS)
+  {
+    tag_ids[tag_count] = id;
+    tag_distances[tag_count] = 0.0f;
+    tag_count++;
+    // uart_printf("New tag detected: %04X \r\n", (unsigned)id);
+  }
+  // else
+  // {
+  //   uart_printf("Tag list full! \r\n");
+  // }
+}
+
+static double compute_distance(const evt_t *e)
+{
+  float clockOffsetRatio = e->carrier * (FREQ_OFFSET_MULTIPLIER * HERTZ_TO_PPM_MULTIPLIER_CHAN_5 / 1.0e6);
+  int32 rtd_init = e->resp_rx_ts - e->poll_tx_ts;
+  int32 rtd_resp = e->resp_tx_ts - e->poll_rx_ts;
+
+  tof = ((rtd_init - rtd_resp * (1.0f - clockOffsetRatio)) / 2.0f) * DWT_TIME_UNITS;
+  distance = tof * SPEED_OF_LIGHT;
+  return distance;
+}
+
+/* Affiche (UART) ce que l'interruption a recu */
+static void handle_events(void)
+{
+  while (evt_r != evt_w)
+  {
+    evt_t e = evt_q[evt_r];
+    evt_r = (uint8)((evt_r + 1) % EVT_N);
+
+    if (e.type == EVT_POLL_RX)
+    {
+      // uart_printf("Reception POLL from %04X \r\n", (unsigned)e.src);
+      // if (e.resp_sent)
+      //   uart_printf("Send RESP from %04X to %04X \r\n", (unsigned)my_id, (unsigned)e.src);
+      // else
+      //   uart_printf("RESP trop tardive\r\n");
+      add_tag_in_my_list(e.src);
+    }
+    else if (e.type == EVT_RESP_RX)
+    {
+      double d = compute_distance(&e);
+      int idx;
+
+      rx_count++;
+      add_tag_in_my_list(e.src);
+      idx = tag_index(e.src);
+      if (idx >= 0) tag_distances[idx] = (float)d;
+
+      // uart_printf("Reception RESP from %04X \r\n", (unsigned)e.src);
+      uart_printf("%04X,%f \r\n", (unsigned)e.src, d);
+    }
+  }
+}
+
+/* Filet de securite : si la broche IRQ est restee a 1 (front montant perdu pendant que
+   l'interruption etait masquee), on traite l'evenement a la main. */
+static void irq_safety_net(void)
+{
+  if (nrf_gpio_pin_read(DW1000_IRQ))
+  {
+    uint32_t en = dw_irq_off();
+    dwt_isr();
+    dw_irq_on(en);
+  }
+}
+
+/* Attend ms millisecondes en traitant les evenements au fil de l'eau (pas de blocage du recepteur) */
+static void wait_and_handle(uint32_t ms)
+{
+  TickType_t start = xTaskGetTickCount();
+  TickType_t dur   = pdMS_TO_TICKS(ms);
+
+  while ((TickType_t)(xTaskGetTickCount() - start) < dur)
+  {
+    handle_events();
+    irq_safety_net();
+    vTaskDelay(1);
+  }
+  handle_events();
+}
+
+/* Envoi d'un poll (interruption DW1000 masquee pendant l'acces SPI) */
+static void send_POLL(uint16_t dest)
+{
+  uint32_t en = dw_irq_off();
+
+  dwt_forcetrxoff();                            /* arrete l'ecoute en cours */
+
+  tx_poll_msg[5] = dest & 0xFF;     tx_poll_msg[6] = dest >> 8;       /* destination */
+  tx_poll_msg[7] = my_id & 0xFF;    tx_poll_msg[8] = my_id >> 8;      /* source */
+  tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb++;
+
+  last_tx_func  = FUNC_POLL;
+  poll_dest     = dest;
+  awaiting_resp = true;
+
+  dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
+  dwt_writetxfctrl(sizeof(tx_poll_msg), 0, 1);
+
+  /* Le recepteur s'allume tout seul apres dwt_setrxaftertxdelay() (regle dans main.c) */
+  if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS)
+  {
+    awaiting_resp = false;
+    rx_restart();
+  }
+  tx_count++;
+
+  dw_irq_on(en);
+}
+
+int ss_init_run(uint16_t target_id)
+{
+  send_POLL(target_id);
+  // uart_printf("Send POLL from %04X to %04X \r\n", (unsigned)my_id, (unsigned)target_id);
+
+  wait_and_handle(RESP_WAIT_MS);                /* la reponse arrive par interruption */
+
+  if (awaiting_resp)
+  {
+    awaiting_resp = false;
+    // if (target_id != TARGET_ALL)
+      // uart_printf("Pas de reponse de %04X \r\n", (unsigned)target_id);
+  }
+  return 1;
+}
+
+/* Poll direct de chaque carte connue (pas de diffusion) */
+static void poll_known_tags(void)
+{
+  uint8_t n = tag_count;
+  for (uint8_t i = 0; i < n; i++)
+  {
+    ss_init_run(tag_ids[i]);
+  }
+}
+
+static bool is_due(TickType_t t)
+{
+  return (int32_t)(xTaskGetTickCount() - t) >= 0;
+}
+
+/**@brief Tache : configure les interruptions du DW1000, puis contacte les autres toutes les minutes.
+*/
+void ss_initiator_task_function (void * pvParameter)
+{
+  UNUSED_PARAMETER(pvParameter);
+
+  my_id = (uint16_t)(NRF_FICR->DEVICEID[0] & 0xFFFF);
+  uart_printf("Mon id : %04X\r\n", (unsigned)my_id);
+
+  /* Interruptions DW1000 : le masque (SYS_MASK, 0x0E) est vide apres la mise sous tension.
+     TFRS = emission terminee, RFCG = trame correcte, RFTO = timeout de trame,
+     RPHE / RFCE / RFSL / SFDT = erreurs de reception (sans elles le recepteur resterait
+     eteint apres une erreur, y compris le timeout SFD de la configuration). */
+  dwt_setcallbacks(tx_ok_cb, rx_ok_cb, rx_to_cb, rx_err_cb);
+  dwt_setinterrupt(DWT_INT_TFRS | DWT_INT_RFCG | DWT_INT_RFTO |
+                   DWT_INT_RPHE | DWT_INT_RFCE | DWT_INT_RFSL | DWT_INT_SFDT, 1);
+  uart_printf("SYS_MASK = %08lX\r\n", (unsigned long)dwt_read32bitreg(SYS_MASK_ID));
+
+  dwt_setleds(DWT_LEDS_ENABLE);
+
+  {
+    uint32_t en = dw_irq_off();
+    rx_restart();                               /* ecoute permanente (timeout de trame = 0 dans main.c) */
+    dw_irq_on(en);
+  }
+
+  /* Decalage au demarrage propre a chaque carte, pour que deux cartes n'emettent pas en meme temps */
+  wait_and_handle(500 + (my_id % 500));
+
+    TickType_t next_disc = xTaskGetTickCount();   /* decouverte des le depart */
+  TickType_t next_poll = next_disc;
+
+  while (true)
+  {
+    if (is_due(next_disc))
+    {
+      /* Toutes les 10 s : diffusion pour trouver de nouvelles cartes (remplace le poll de cette seconde) */
+      TickType_t t0 = xTaskGetTickCount();
+      ss_init_run(TARGET_ALL);
+      next_disc = t0 + pdMS_TO_TICKS(DISCOVER_PERIOD_MS);
+      next_poll = t0 + pdMS_TO_TICKS(POLL_KNOWN_PERIOD_MS);
+    }
+    else if (is_due(next_poll))
+    {
+      /* Sinon, toutes les secondes : poll des cartes deja connues */
+      TickType_t t0 = xTaskGetTickCount();
+      poll_known_tags();
+      next_poll = t0 + pdMS_TO_TICKS(POLL_KNOWN_PERIOD_MS);
+    }
+
+    wait_and_handle(10);                        /* ecoute, reponses et affichage entre deux echeances */
+  }
+}
+
 /*****************************************************************************************************************************************************
 * NOTES:
 *
-* 1. The frames used here are Decawave specific ranging frames, complying with the IEEE 802.15.4 standard data frame encoding. The frames are the
-*    following:
-*     - a poll message sent by the initiator to trigger the ranging exchange.
-*     - a response message sent by the responder to complete the exchange and provide all information needed by the initiator to compute the
-*       time-of-flight (distance) estimate.
-*    The first 10 bytes of those frame are common and are composed of the following fields:
-*     - byte 0/1: frame control (0x8841 to indicate a data frame using 16-bit addressing).
-*     - byte 2: sequence number, incremented for each new frame.
-*     - byte 3/4: PAN ID (0xDECA).
-*     - byte 5/6: destination address, see NOTE 2 below.
-*     - byte 7/8: source address, see NOTE 2 below.
-*     - byte 9: function code (specific values to indicate which message it is in the ranging process).
-*    The remaining bytes are specific to each message as follows:
-*    Poll message:
-*     - no more data
-*    Response message:
-*     - byte 10 -> 13: poll message reception timestamp.
-*     - byte 14 -> 17: response message transmission timestamp.
-*    All messages end with a 2-byte checksum automatically set by DW1000.
-* 2. Source and destination addresses are hard coded constants in this example to keep it simple but for a real product every device should have a
-*    unique ID. Here, 16-bit addressing is used to keep the messages as short as possible but, in an actual application, this should be done only
-*    after an exchange of specific messages used to define those short addresses for each device participating to the ranging exchange.
-* 3. dwt_writetxdata() takes the full size of the message as a parameter but only copies (size - 2) bytes as the check-sum at the end of the frame is
-*    automatically appended by the DW1000. This means that our variable could be two bytes shorter without losing any data (but the sizeof would not
-*    work anymore then as we would still have to indicate the full length of the frame to dwt_writetxdata()).
-* 4. We use polled mode of operation here to keep the example as simple as possible but all status events can be used to generate interrupts. Please
-*    refer to DW1000 User Manual for more details on "interrupts". It is also to be noted that STATUS register is 5 bytes long but, as the event we
-*    use are all in the first bytes of the register, we can use the simple dwt_read32bitreg() API call to access it instead of reading the whole 5
-*    bytes.
-* 5. The high order byte of each 40-bit time-stamps is discarded here. This is acceptable as, on each device, those time-stamps are not separated by
-*    more than 2**32 device time units (which is around 67 ms) which means that the calculation of the round-trip delays can be handled by a 32-bit
-*    subtraction.
-* 6. The user is referred to DecaRanging ARM application (distributed with EVK1000 product) for additional practical example of usage, and to the
-*     DW1000 API Guide for more details on the DW1000 driver functions.
-* 7. The use of the carrier integrator value to correct the TOF calculation, was added Feb 2017 for v1.3 of this example.  This significantly
-*     improves the result of the SS-TWR where the remote responder unit's clock is a number of PPM offset from the local inmitiator unit's clock.
-*     As stated in NOTE 2 a fixed offset in range will be seen unless the antenna delsy is calibratred and set correctly.
+* 1. Trames (IEEE 802.15.4, adresses sur 16 bits) : octets 0-1 frame control (0x8841), 2 numero de sequence, 3-4 PAN ID (0xDECA),
+*    5-6 adresse destination, 7-8 adresse source, 9 code fonction (0xE0 = poll, 0xE1 = reponse). La reponse contient ensuite deux horodatages
+*    de 4 octets (reception du poll, emission de la reponse, octets 10-13 et 14-17), puis le CRC (2 octets) ajoute par le DW1000.
+* 2. Adresse = 16 bits de poids faible de NRF_FICR->DEVICEID[0] : unique par carte en pratique, aucune valeur codee en dur.
+*    0xFFFF est l'adresse de diffusion (poll de decouverte).
+* 3. Reception par interruption : le masque SYS_MASK doit etre ecrit (dwt_setinterrupt), sinon la broche IRQ ne se leve jamais. Les bits de
+*    SYS_STATUS sont acquittes par dwt_isr(). Apres une bonne trame en tampon simple (RXAUTR = 0) le recepteur s'arrete : rx_restart() le relance.
+*    Apres un timeout de trame, il ne se reactive jamais seul (manuel DW1000, registre 0x0C) : d'ou le timeout a 0 dans main.c.
+* 4. Si plusieurs cartes repondent en meme temps a un poll en diffusion, leurs reponses se superposent : seule la premiere reponse
+*    exploitable est prise, les autres cartes sont decouvertes quand elles contactent cette carte a leur tour.
+* 5. Les callbacks s'executent dans l'interruption : ils n'appellent ni uart_printf ni fonction FreeRTOS. Les messages sont affiches par la tache,
+*    au plus une periode du tick FreeRTOS apres l'interruption.
+* 6. La reponse doit etre emise POLL_RX_TO_RESP_TX_DLY_UUS apres le poll ; si dwt_starttx() echoue, le message "RESP trop tardive" apparait :
+*    augmenter alors la valeur.
 *
 ****************************************************************************************************************************************************/
