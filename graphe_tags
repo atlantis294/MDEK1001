@@ -1,0 +1,18 @@
+digraph graphe {
+	graph [overlap=false rankdir=LR splines=true]
+	node [color=black fillcolor=lightblue fontname=Arial shape=circle style=filled]
+	edge [arrowsize=0.8 color=gray40 fontname=Arial fontsize=10]
+	D44B [label=D44B]
+	B089 [label=B089]
+	"0CC2" [label="0CC2"]
+	3983 [label=3983]
+	D44B -> B089 [label="0.21 m"]
+	D44B -> "0CC2" [label="0.83 m"]
+	D44B -> 3983 [label="0.66 m"]
+	B089 -> D44B [label="0.21 m"]
+	B089 -> "0CC2" [label="0.68 m"]
+	B089 -> 3983 [label="0.39 m"]
+	"0CC2" -> D44B [label="0.90 m"]
+	"0CC2" -> B089 [label="0.64 m"]
+	"0CC2" -> 3983 [label="1.31 m"]
+}

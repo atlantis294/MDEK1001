@@ -67,3 +67,7 @@ dkms.conf
 **/Keil uvision/_build/
 **/JLinkLog.txt
 *.hex
+
+
+# Virtual environnement for python
+venv/

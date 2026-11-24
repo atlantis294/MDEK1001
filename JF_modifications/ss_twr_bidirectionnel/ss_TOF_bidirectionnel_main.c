@@ -2,12 +2,16 @@
 *  @file    ss_TOF_bidirectionnel_main.c
 *  @brief   SS-TWR bidirectionnel : chaque carte est a la fois initiateur et repondeur.
 *
-*           - Toutes les POLL_PERIOD_MS (1 minute) la carte tente de contacter les autres :
-*             un poll en diffusion (decouverte) puis un poll direct vers chaque carte connue.
+*           - Toutes les POLL_KNOWN_PERIOD_MS (1 s) la carte poll les cartes deja connues.
+*           - Toutes les DISCOVER_PERIOD_MS (10 s) elle envoie un poll en diffusion pour decouvrir
+*             de nouvelles cartes.
 *           - Le reste du temps le recepteur du DW1000 reste allume. Des qu'une trame arrive,
 *             l'IRQ du DW1000 declenche dwt_isr() -> rx_ok_cb() qui lit la trame, repond au
 *             poll (emission differee) ou enregistre la reponse recue. Les messages UART sont
 *             ensuite affiches par la tache (jamais dans l'interruption).
+*           - Apres chaque mesure, la distance (en cm) est renvoyee a la carte qui vient de repondre
+*             dans une trame FUNC_DISTANCE (0xE2) : source = carte qui a mesure, destinataire = carte
+*             mesuree. Chaque carte connait ainsi la distance qui la separe de ses voisines.
 *
 *           Chaine : DW1000 IRQ -> GPIOTE (main.c, vInterruptHandler) -> dwt_isr() -> callbacks.
 *
@@ -49,6 +53,7 @@
 #define TARGET_ALL       0xFFFF      /* adresse de diffusion */
 #define FUNC_POLL        0xE0
 #define FUNC_RESP        0xE1
+#define FUNC_DISTANCE    0xE2
 
 /* Delai poll recu -> reponse emise (valeur de ss_resp_main.c pour le nRF) */
 #define POLL_RX_TO_RESP_TX_DLY_UUS 1100
@@ -64,10 +69,17 @@ static const uint8 rx_hdr[5] = {0x41, 0x88, 0, 0xCA, 0xDE};   /* FC, SN (=0), PA
 static uint8 tx_poll_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, FUNC_POLL, 0, 0};
 static uint8 tx_resp_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, FUNC_RESP, 0,0,0,0, 0,0,0,0, 0, 0};
 
+/* Trame de distance : source = carte qui a mesure, destinataire = carte mesuree (celle qui a envoye la reponse).
+   Octets 10-13 = distance en cm (int32, poids faible d'abord), 14-15 = CRC. */
+static uint8 tx_dist_msg[] = {0x41, 0x88, 0, 0xCA, 0xDE, 0, 0, 0, 0, FUNC_DISTANCE,
+                              0, 0, 0, 0,
+                              0, 0};
+
 #define ALL_MSG_SN_IDX          2
 #define RESP_MSG_POLL_RX_TS_IDX 10
 #define RESP_MSG_RESP_TX_TS_IDX 14
 #define RESP_MSG_TS_LEN         4
+#define DIST_MSG_VAL_IDX        10
 
 #define RX_BUF_LEN 20                /* la plus longue trame (reponse) : 20 octets avec le CRC */
 static uint8 rx_buffer[RX_BUF_LEN];
@@ -80,7 +92,7 @@ static uint8    frame_seq_nb = 0;
 static volatile int tx_count = 0;
 static volatile int rx_count = 0;
 
-static volatile uint8    last_tx_func     = 0;  /* FUNC_POLL ou FUNC_RESP : dernier type emis */
+static volatile uint8    last_tx_func     = 0;  /* FUNC_POLL, FUNC_RESP ou FUNC_DISTANCE : dernier type emis */
 static volatile uint32   poll_tx_ts_saved = 0;  /* horodatage d'emission de MON dernier poll */
 static volatile bool     awaiting_resp    = false;
 static volatile uint16_t poll_dest        = TARGET_ALL;
@@ -89,8 +101,9 @@ static double tof;
 static double distance;
 
 /* File d'evenements : l'interruption ecrit, la tache lit (un seul producteur, un seul consommateur) */
-#define EVT_POLL_RX 1
-#define EVT_RESP_RX 2
+#define EVT_POLL_RX     1
+#define EVT_RESP_RX     2
+#define EVT_DISTANCE_RX 3
 
 typedef struct {
   uint8    type;
@@ -100,6 +113,7 @@ typedef struct {
   uint32   poll_tx_ts, resp_rx_ts;              /* EVT_RESP_RX : horodatages locaux */
   uint32   poll_rx_ts, resp_tx_ts;              /* EVT_RESP_RX : horodatages du repondeur */
   int32    carrier;
+  int32    distance_cm;                         /* EVT_DISTANCE_RX : distance recue */
 } evt_t;
 
 #define EVT_N 16
@@ -195,7 +209,7 @@ static bool send_RESP(uint16_t dest)
   return (dwt_starttx(DWT_START_TX_DELAYED) == DWT_SUCCESS);
 }
 
-/* Fin d'emission (poll ou reponse) */
+/* Fin d'emission (poll, reponse ou distance) */
 static void tx_ok_cb(const dwt_cb_data_t *cb_data)
 {
   (void)cb_data;
@@ -207,7 +221,7 @@ static void tx_ok_cb(const dwt_cb_data_t *cb_data)
   }
   else
   {
-    rx_restart();                               /* reponse partie : retour a l'ecoute */
+    rx_restart();                               /* reponse ou distance partie : retour a l'ecoute */
   }
 }
 
@@ -262,6 +276,22 @@ static void rx_ok_cb(const dwt_cb_data_t *cb_data)
           awaiting_resp = false;
         }
       }
+      /* Distance que la carte rx_src vient de mesurer entre elle et moi */
+      else if (rx_func == FUNC_DISTANCE)
+      {
+        evt_t *e = evt_slot();
+        if (e)
+        {
+          e->type        = EVT_DISTANCE_RX;
+          e->src         = rx_src;
+          e->dest        = rx_dest;
+          e->distance_cm = (int32)((uint32)rx_buffer[DIST_MSG_VAL_IDX]
+                                 | ((uint32)rx_buffer[DIST_MSG_VAL_IDX + 1] << 8)
+                                 | ((uint32)rx_buffer[DIST_MSG_VAL_IDX + 2] << 16)
+                                 | ((uint32)rx_buffer[DIST_MSG_VAL_IDX + 3] << 24));
+          evt_commit();
+        }
+      }
     }
   }
 
@@ -307,6 +337,36 @@ static void dw_irq_on(uint32_t was_enabled)
   if (was_enabled) NVIC_EnableIRQ(GPIOTE_IRQn);
 }
 
+/* Envoi de la distance mesuree (cote tache) a la carte qui vient de repondre.
+   Pas de reponse attendue : emission immediate.
+   dest : carte mesuree (celle qui a envoye la reponse)
+   cm   : distance en centimetres */
+static void send_DISTANCE(uint16_t dest, int32 cm)
+{
+  uint32_t en = dw_irq_off();
+
+  dwt_forcetrxoff();                            /* arrete l'ecoute en cours */
+
+  tx_dist_msg[5] = dest & 0xFF;     tx_dist_msg[6] = dest >> 8;       /* destination = carte mesuree */
+  tx_dist_msg[7] = my_id & 0xFF;    tx_dist_msg[8] = my_id >> 8;      /* source = carte qui a mesure */
+  tx_dist_msg[ALL_MSG_SN_IDX] = frame_seq_nb++;
+  for (int i = 0; i < 4; i++)
+  {
+    tx_dist_msg[DIST_MSG_VAL_IDX + i] = ((uint32)cm >> (8 * i)) & 0xFF;
+  }
+
+  last_tx_func = FUNC_DISTANCE;
+  dwt_writetxdata(sizeof(tx_dist_msg), tx_dist_msg, 0);
+  dwt_writetxfctrl(sizeof(tx_dist_msg), 0, 0);  /* 0 : trame de donnees, pas de ranging */
+
+  if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS)
+  {
+    rx_restart();
+  }
+
+  dw_irq_on(en);
+}
+
 static int tag_index(uint16_t id)
 {
   for (int i = 0; i < tag_count; i++)
@@ -334,6 +394,7 @@ static void add_tag_in_my_list(uint16_t id)
   // }
 }
 
+/* Calcule la distance (m) a partir des horodatages */
 static double compute_distance(const evt_t *e)
 {
   float clockOffsetRatio = e->carrier * (FREQ_OFFSET_MULTIPLIER * HERTZ_TO_PPM_MULTIPLIER_CHAN_5 / 1.0e6);
@@ -342,10 +403,13 @@ static double compute_distance(const evt_t *e)
 
   tof = ((rtd_init - rtd_resp * (1.0f - clockOffsetRatio)) / 2.0f) * DWT_TIME_UNITS;
   distance = tof * SPEED_OF_LIGHT;
+  if (distance < 0.0) return 0.0;               /* evite les valeurs negatives */
+
   return distance;
 }
 
-/* Affiche (UART) ce que l'interruption a recu */
+/* Traite (UART, envoi des distances) ce que l'interruption a recu.
+   Format des lignes : carte_qui_mesure,carte_mesuree,distance_m */
 static void handle_events(void)
 {
   while (evt_r != evt_w)
@@ -365,6 +429,7 @@ static void handle_events(void)
     else if (e.type == EVT_RESP_RX)
     {
       double d = compute_distance(&e);
+      int32  cm = (int32)(d * 100.0 + 0.5);
       int idx;
 
       rx_count++;
@@ -373,7 +438,15 @@ static void handle_events(void)
       if (idx >= 0) tag_distances[idx] = (float)d;
 
       // uart_printf("Reception RESP from %04X \r\n", (unsigned)e.src);
-      uart_printf("%04X,%f \r\n", (unsigned)e.src, d);
+      uart_printf("%04X,%04X,%.2f \r\n", (unsigned)my_id, (unsigned)e.src, d);
+
+      send_DISTANCE(e.src, cm);                 /* renvoie la mesure a la carte qui a repondu */
+    }
+    else if (e.type == EVT_DISTANCE_RX)
+    {
+      /* e.src a mesure la distance entre elle et moi (e.dest = my_id) */
+      add_tag_in_my_list(e.src);
+      uart_printf("%04X,%04X,%.2f \r\n", (unsigned)e.src, (unsigned)e.dest, e.distance_cm / 100.0);
     }
   }
 }
@@ -445,7 +518,7 @@ int ss_init_run(uint16_t target_id)
   {
     awaiting_resp = false;
     // if (target_id != TARGET_ALL)
-      // uart_printf("Pas de reponse de %04X \r\n", (unsigned)target_id);
+    //   uart_printf("Pas de reponse de %04X \r\n", (unsigned)target_id);
   }
   return 1;
 }
@@ -465,7 +538,7 @@ static bool is_due(TickType_t t)
   return (int32_t)(xTaskGetTickCount() - t) >= 0;
 }
 
-/**@brief Tache : configure les interruptions du DW1000, puis contacte les autres toutes les minutes.
+/**@brief Tache : configure les interruptions du DW1000, puis contacte les autres cartes.
 */
 void ss_initiator_task_function (void * pvParameter)
 {
@@ -494,7 +567,7 @@ void ss_initiator_task_function (void * pvParameter)
   /* Decalage au demarrage propre a chaque carte, pour que deux cartes n'emettent pas en meme temps */
   wait_and_handle(500 + (my_id % 500));
 
-    TickType_t next_disc = xTaskGetTickCount();   /* decouverte des le depart */
+  TickType_t next_disc = xTaskGetTickCount();   /* decouverte des le depart */
   TickType_t next_poll = next_disc;
 
   while (true)
@@ -523,10 +596,12 @@ void ss_initiator_task_function (void * pvParameter)
 * NOTES:
 *
 * 1. Trames (IEEE 802.15.4, adresses sur 16 bits) : octets 0-1 frame control (0x8841), 2 numero de sequence, 3-4 PAN ID (0xDECA),
-*    5-6 adresse destination, 7-8 adresse source, 9 code fonction (0xE0 = poll, 0xE1 = reponse). La reponse contient ensuite deux horodatages
-*    de 4 octets (reception du poll, emission de la reponse, octets 10-13 et 14-17), puis le CRC (2 octets) ajoute par le DW1000.
+*    5-6 adresse destination, 7-8 adresse source, 9 code fonction (0xE0 = poll, 0xE1 = reponse, 0xE2 = distance).
+*    Reponse : deux horodatages de 4 octets (reception du poll, emission de la reponse, octets 10-13 et 14-17), puis le CRC.
+*    Distance : octets 10-13 distance en cm (int32, poids faible d'abord), puis le CRC (2 octets) ajoute par le DW1000, soit 16 octets.
+*    Source = carte qui a mesure, destinataire = carte mesuree : pas de champ supplementaire.
 * 2. Adresse = 16 bits de poids faible de NRF_FICR->DEVICEID[0] : unique par carte en pratique, aucune valeur codee en dur.
-*    0xFFFF est l'adresse de diffusion (poll de decouverte).
+*    0xFFFF est l'adresse de diffusion (poll de decouverte uniquement).
 * 3. Reception par interruption : le masque SYS_MASK doit etre ecrit (dwt_setinterrupt), sinon la broche IRQ ne se leve jamais. Les bits de
 *    SYS_STATUS sont acquittes par dwt_isr(). Apres une bonne trame en tampon simple (RXAUTR = 0) le recepteur s'arrete : rx_restart() le relance.
 *    Apres un timeout de trame, il ne se reactive jamais seul (manuel DW1000, registre 0x0C) : d'ou le timeout a 0 dans main.c.
@@ -534,7 +609,9 @@ void ss_initiator_task_function (void * pvParameter)
 *    exploitable est prise, les autres cartes sont decouvertes quand elles contactent cette carte a leur tour.
 * 5. Les callbacks s'executent dans l'interruption : ils n'appellent ni uart_printf ni fonction FreeRTOS. Les messages sont affiches par la tache,
 *    au plus une periode du tick FreeRTOS apres l'interruption.
-* 6. La reponse doit etre emise POLL_RX_TO_RESP_TX_DLY_UUS apres le poll ; si dwt_starttx() echoue, le message "RESP trop tardive" apparait :
-*    augmenter alors la valeur.
+* 6. La reponse doit etre emise POLL_RX_TO_RESP_TX_DLY_UUS apres le poll ; si dwt_starttx() echoue, la reponse ne part pas
+*    (reactiver le message "RESP trop tardive" dans handle_events) : augmenter alors la valeur.
+* 7. Le DW1000 n'ecoute pas avant d'emettre : deux emissions simultanees se perdent, sans accuse de reception. Les trames de distance
+*    ne sont pas retransmises.
 *
 ****************************************************************************************************************************************************/

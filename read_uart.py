@@ -1,11 +1,11 @@
 import serial
-import serial.tools.list_ports
 import time
 
 # Configurer le port et la vitesse (baudrate)
-PORT = "/dev/ttyACM2" 
+PORT = "/dev/ttyACM0" 
 BAUDRATE = 115200
 T0 = time.time()
+
 
 try:
     with serial.Serial(PORT, BAUDRATE, timeout=1) as ser:
